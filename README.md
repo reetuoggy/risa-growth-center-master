@@ -24,7 +24,6 @@
 
 ## 2. Challenge and city
 
-- **Why Challenge B.** It is where my experience gives an edge, and the sponsor data has a decisive, testable insight about channel mix.
 - **Why Mumbai** (scores in [research/fact_base.md §2](research/fact_base.md)).
   - Weighted score: Delhi-NCR 8.95, Mumbai 8.90, Bengaluru 7.40, Chennai 6.00. Weights: brand-HQ pool 30%, students 20%, agency access 15%, fest precedent 15%, venue cost 10%, startup funding 10%. The top two are within noise.
   - **Tiebreak (sourced):** the largest bank/UPI title buyers of 2024–26 make budget decisions in Mumbai — NPCI (BKC), SBI Corporate Centre and Union Bank Central Office (Nariman Point), IDFC FIRST corporate office (BKC). Not every fintech is in Mumbai; if the sponsor mix were D2C or quick-commerce led, **Delhi-NCR would win**.
