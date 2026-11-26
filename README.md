@@ -4,7 +4,6 @@
 **Challenge:** B — Sponsorship Growth: maximise sponsorship **cash collected before the festival**
 **Live app:** **https://risa-growth-center-three.vercel.app**
 
-> I ran sponsorship sales for a large Indian college fest. The lesson I carried into this case: *a signed deal is not cash*. So the north-star metric is **cash in the bank 14 days before the fest (T-14), net of TDS** — not "confirmed value".
 
 ---
 
