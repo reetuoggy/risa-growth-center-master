@@ -6,34 +6,36 @@
 import type { DB } from "../types";
 import { OPEN_STAGES } from "../types";
 import {
-  snapshot, kpis, funnelRows, scaleChangeStop, weakestStep, bottlenecks, forecast, cashCollection, weeklySeries,
-  opportunityList, findBrands, forecastBacktest, parseAsOf, paymentAsOf, eodIST, brandDetail, taskView, dataDictionary, stalled, dedupe, ts, ownerRows, Snapshot,
+  snapshot, kpis, funnelRows, scaleChangeStop, bottlenecks, forecast, cashCollection, weeklySeries,
+  opportunityList, findBrands, forecastBacktest, parseAsOf, paymentAsOf, eodIST, brandDetail, taskView, dataDictionary, stalled, dedupe, ts, ownerRows, mouStartByOpp, calendarDaysIST, WARM_CHANNELS, Snapshot,
 } from "../metrics";
 import { evaluate } from "./calc";
 import { plan2027 } from "../plan";
 import { betSignals } from "../bets";
+import { searchKnowledge } from "./knowledge";
 
 type Json = Record<string, unknown>;
 const AS_OF = { type: "string", description: "Snapshot date YYYY-MM-DD (end of day, Asia/Kolkata). Omit to use the dashboard's current as-of date." };
 
 export const TOOL_DECLARATIONS = [
-  { name: "get_kpis", description: "Headline KPIs at a date: targets & attainment, qualified brands, confirmed partnerships, confirmed value (cash-type vs in-kind), open pipeline, stage counts, outreach volumes, linear pacing, forecast, simulated cash, duplicate rows removed.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF } } },
-  { name: "get_funnel", description: "Brand-level funnel grouped by campaign, owner, industry or channel_group (warm/inbound vs cold outbound): brands touched, attempts, sends, replied, met, qualified, opportunities, confirmed, lost, values, rates and SIMULATED budget/hours efficiency.", parametersJsonSchema: { type: "object", properties: { group_by: { type: "string", enum: ["campaign", "owner", "industry", "channel_group"] }, as_of: AS_OF }, required: ["group_by"] } },
-  { name: "diagnose_campaigns", description: "Bottleneck diagnosis: for each campaign the SCALE/CHANGE/STOP/TOO_EARLY verdict with the rule that fired, the weakest funnel step, open pipeline; plus stalled open opportunities (>14 days without a stage change).", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF } } },
-  { name: "list_opportunities", description: "List opportunities with their LATEST stage at the as-of date. Filters are optional.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF, stage: { type: "string", enum: ["prospecting", "contacted", "proposal_sent", "negotiating", "partner_confirmed", "lost", "withdrawn"] }, campaign: { type: "string", description: "campaign name substring or SC id" }, owner: { type: "string", description: "owner name substring or T id" }, support_type: { type: "string", enum: ["cash", "in_kind"] }, brand: { type: "string" }, open_only: { type: "boolean" }, min_value: { type: "number" }, limit: { type: "number" } } } },
+  { name: "get_kpis", description: "Headline 2025 KPIs at a date: targets & attainment, qualified brands, confirmed partnerships, confirmed value (cash-type vs in-kind), open pipeline, stage counts, outreach volumes, brand ownership distribution (180 brands by owner), linear pacing, forecast, simulated cash, duplicate rows removed.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF } } },
+  { name: "get_funnel", description: "Brand-level funnel grouped by campaign, owner (includes brands_owned across 180 brands and opportunity ownership across deal owners), industry (2025 brand sectors — distinct from 2027 fest vertical titles) or channel_group (warm/inbound vs cold outbound).", parametersJsonSchema: { type: "object", properties: { group_by: { type: "string", enum: ["campaign", "owner", "industry", "channel_group"] }, as_of: AS_OF }, required: ["group_by"] } },
+  { name: "diagnose_campaigns", description: "2025 bottleneck diagnosis: SCALE/CHANGE/STOP/TOO_EARLY verdicts for historical campaigns SC01-SC06 (close-rate rules), weakest funnel step, owner workload summary, and stalled OPEN opportunities (>14 days idle, with warm vs cold split and brand/owner/opp IDs). Note: for 2027 bets and 120%/70% thresholds, use get_bet_signals.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF } } },
+  { name: "list_opportunities", description: "List opportunities with their LATEST stage at the as-of date, including channel_group (warm/inbound vs cold outbound) and by_stage/by_channel_group summaries. Filters are optional.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF, stage: { type: "string", enum: ["prospecting", "contacted", "proposal_sent", "negotiating", "partner_confirmed", "lost", "withdrawn"] }, campaign: { type: "string", description: "campaign name substring or SC id" }, owner: { type: "string", description: "owner name substring or T id" }, support_type: { type: "string", enum: ["cash", "in_kind"] }, brand: { type: "string" }, open_only: { type: "boolean" }, min_value: { type: "number" }, limit: { type: "number" } } } },
   { name: "get_brand", description: "Everything about one brand at the as-of date: contacts (with opt-out flags), qualification history, interaction timeline, opportunities with stage history, simulated payments, activations, tasks. Accepts brand name or id (A001...).", parametersJsonSchema: { type: "object", properties: { name_or_id: { type: "string" }, as_of: AS_OF }, required: ["name_or_id"] } },
-  { name: "forecast", description: "Projected confirmed partnerships/value at the as-of date from open pipeline (campaign-aware historical stage weights x stall factor; zero after event start). Optional what-if: force specific opportunity ids to close or drop.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF, close_opportunity_ids: { type: "array", items: { type: "string" } }, drop_opportunity_ids: { type: "array", items: { type: "string" } } } } },
-  { name: "get_cash_collection", description: "SIMULATED invoices/receipts (the source has no bank data): invoiced, received net of 2% TDS, outstanding, overdue list, cash received by T-14.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF } } },
+  { name: "forecast", description: "Projected confirmed partnerships/value at the as-of date from open pipeline plus historical reliability_backtest (including 15 Mar forecast 26.9 vs actual 24). Optional what-if: close or drop specific opportunity ids.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF, close_opportunity_ids: { type: "array", items: { type: "string" } }, drop_opportunity_ids: { type: "array", items: { type: "string" } } } } },
+  { name: "get_cash_collection", description: "SIMULATED invoices/receipts (no bank data exists): invoiced, received net of 2% TDS, outstanding, overdue list, cash by T-14, AND mou_to_advance tracking calendar days from MoU (partner_confirmed date) to advance paid against the 15-day target.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF } } },
   { name: "compare_dates", description: "Compare KPIs between two dates to explain what changed (deltas in qualified, confirmed, value, pipeline, outreach).", parametersJsonSchema: { type: "object", properties: { date_a: { type: "string" }, date_b: { type: "string" } }, required: ["date_a", "date_b"] } },
   { name: "get_trend", description: "Weekly cumulative series from history start to as-of: qualified, confirmed, confirmed value, simulated cash, goals.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF } } },
   { name: "get_targets", description: "All target plan versions (launch and revised) with effective dates.", parametersJsonSchema: { type: "object", properties: {} } },
   { name: "get_tasks", description: "Team tasks with owner, due date, status, priority, linked entity; overdue is relative to the as-of date.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF, status: { type: "string", enum: ["todo", "in_progress", "blocked", "done"] }, owner: { type: "string" }, overdue_only: { type: "boolean" } } } },
-  { name: "query_records", description: "Flexible read-only query for questions the other tools don't cover. Tables (snapshot at as_of): brands (incl. latest qualification_status, industry, owner), contacts (incl. opted_out), interactions (deduplicated, <= as_of), opportunities (latest state), opportunity_versions, qualification_versions, payments (simulated), tasks, campaigns (incl. simulated budget/hours), activations. Supports filters, group_by + aggregate, sort, limit.", parametersJsonSchema: { type: "object", properties: { table: { type: "string", enum: ["brands", "contacts", "interactions", "opportunities", "opportunity_versions", "qualification_versions", "payments", "tasks", "campaigns", "activations"] }, as_of: AS_OF, filters: { type: "array", items: { type: "object", properties: { field: { type: "string" }, op: { type: "string", enum: ["eq", "neq", "in", "contains", "gt", "gte", "lt", "lte", "is_null", "not_null"] }, value: { type: "string", description: "Comparison value as text: number (25000), date YYYY-MM-DD, true/false, or comma-separated list for 'in'." } }, required: ["field", "op"] } }, group_by: { type: "array", items: { type: "string" } }, aggregate: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max"] }, field: { type: "string", description: "field for the aggregate (count_distinct/sum/avg/min/max)" }, sort_by: { type: "string" }, sort_desc: { type: "boolean" }, limit: { type: "number" } }, required: ["table"] } },
+  { name: "query_records", description: "Flexible read-only query for questions the other tools don't cover. Prefer group_by + aggregate when summarizing >50 rows (default limit is 50). Tables (snapshot at as_of): brands, contacts, interactions, opportunities, opportunity_versions, qualification_versions, payments (simulated, includes mou_at & days_mou_to_paid), tasks, campaigns, activations.", parametersJsonSchema: { type: "object", properties: { table: { type: "string", enum: ["brands", "contacts", "interactions", "opportunities", "opportunity_versions", "qualification_versions", "payments", "tasks", "campaigns", "activations"] }, as_of: AS_OF, filters: { type: "array", items: { type: "object", properties: { field: { type: "string" }, op: { type: "string", enum: ["eq", "neq", "in", "contains", "gt", "gte", "lt", "lte", "is_null", "not_null"] }, value: { type: "string", description: "Comparison value as text: number (25000), date YYYY-MM-DD, true/false, or comma-separated list for 'in'." } }, required: ["field", "op"] } }, group_by: { type: "array", items: { type: "string" } }, aggregate: { type: "string", enum: ["count", "count_distinct", "sum", "avg", "min", "max"] }, field: { type: "string", description: "field for the aggregate (count_distinct/sum/avg/min/max)" }, sort_by: { type: "string" }, sort_desc: { type: "boolean" }, limit: { type: "number" } }, required: ["table"] } },
   { name: "calculate", description: "Exact arithmetic. Use for every derived number (ratios, differences, percentages, what-ifs). Supports + - * / ^ ( ) and min(), max(), round(x, digits), abs().", parametersJsonSchema: { type: "object", properties: { expression: { type: "string" } }, required: ["expression"] } },
-  { name: "data_dictionary", description: "What data exists, field meanings, which tables are SIMULATED, and what the data cannot answer. Call this when unsure whether data supports a question.", parametersJsonSchema: { type: "object", properties: {} } },
-  { name: "get_bet_signals", description: "Live SCALE/CHANGE/STOP/TOO_EARLY signal per 2027 bet, applying the plan thresholds (120% / 70% of plan) to measurable proxies in the live data (warm engine = SC02+SC05, sponsor store = SC04). Verticals/anchor/hybrid report NOT_MEASURABLE.", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF } } },
-  { name: "get_2027_plan", description: "The forward-looking CampusFest 2027 (Mumbai) sponsorship plan: base/stretch cash targets by T-14, segment model, the five ranked bets with EV, leading indicators and scale/change/stop thresholds, global gates. These are MODEL PROJECTIONS, not actuals.", parametersJsonSchema: { type: "object", properties: {} } },
-  { name: "propose_task", description: "Draft a task for the team. This does NOT save anything: the user must click Confirm in the chat. Use real owner ids from the system prompt and link a brand/opportunity/campaign id when relevant.", parametersJsonSchema: { type: "object", properties: { title: { type: "string" }, description: { type: "string" }, owner_id: { type: "string" }, due_date: { type: "string", description: "YYYY-MM-DD" }, priority: { type: "string", enum: ["low", "medium", "high"] }, brand_id: { type: "string" }, opportunity_id: { type: "string" }, sponsor_campaign_id: { type: "string" }, rationale: { type: "string", description: "data evidence behind this task" } }, required: ["title", "rationale"] } },
+  { name: "data_dictionary", description: "What data exists, field meanings, key definitions (incl. 2025 industries vs 2027 vertical titles, in_kind vs hybrid, MoU->advance 15d target, brand vs deal ownership), which tables are SIMULATED, and what the data cannot answer.", parametersJsonSchema: { type: "object", properties: {} } },
+  { name: "get_bet_signals", description: "Live SCALE/CHANGE/STOP/TOO_EARLY/NOT_MEASURABLE signal AND 2027 plan thresholds (120% scale / 70% stop) for ALL 5 bets (warm, store, verticals, anchor, hybrid).", parametersJsonSchema: { type: "object", properties: { as_of: AS_OF } } },
+  { name: "get_2027_plan", description: "Forward-looking CampusFest 2027 (Mumbai) sponsorship plan & deck model: base cash ₹54.1L, Monte Carlo range P10-P90 ₹42.0L-₹65.8L, stretch ₹1.27 Cr, status-quo ₹14.1L, city selection & Mumbai vs Delhi NCR sponsor-mix tiebreak, segment model (incl. hybrid 50% guaranteed + capped CPA & vertical titles), downside sensitivities (no anchor ₹41.0L), 5 ranked bets, 120%/70% thresholds, and global gates (stop cold, reprice anchor, 100% advance). MODEL PROJECTIONS, not actuals.", parametersJsonSchema: { type: "object", properties: {} } },
+  { name: "search_strategy_docs", description: "Retrieve authoritative CampusFest 2027 strategy deck slides, city selection & sponsor-mix tiebreak (Mumbai vs Delhi NCR), definitions disambiguation (hybrid vs in-kind, vertical titles vs dataset industries, MoU-to-advance 15d), forecast backtest, and fact_base research benchmarks.", parametersJsonSchema: { type: "object", properties: { query: { type: "string", description: "Search query about strategy, city choice, definitions, deck numbers, gates, or benchmarks." }, top_k: { type: "number" } }, required: ["query"] } },
+  { name: "propose_task", description: "Draft a task for the team. Does NOT save anything: the user must click Confirm in the chat. Use real owner ids from the system prompt and link brand_id, opportunity_id, and/or sponsor_campaign_id. IMPORTANT: When drafting tasks for stalled deals, target ONLY stalled open pipeline opportunities (from diagnose_campaigns.stalled_list) — NEVER draft payment/invoice-chasing tasks on confirmed deals.", parametersJsonSchema: { type: "object", properties: { title: { type: "string" }, description: { type: "string" }, owner_id: { type: "string" }, due_date: { type: "string", description: "YYYY-MM-DD" }, priority: { type: "string", enum: ["low", "medium", "high"] }, brand_id: { type: "string" }, opportunity_id: { type: "string" }, sponsor_campaign_id: { type: "string" }, rationale: { type: "string", description: "data evidence behind this task" } }, required: ["title", "rationale"] } },
   { name: "propose_opportunity_update", description: "Draft a stage/value change for an opportunity (appends a new version). Does NOT save: the user must click Confirm.", parametersJsonSchema: { type: "object", properties: { opportunity_id: { type: "string" }, stage: { type: "string", enum: ["prospecting", "contacted", "proposal_sent", "negotiating", "partner_confirmed", "lost", "withdrawn"] }, effective_date: { type: "string" }, proposed_value_inr: { type: "number" }, confirmed_value_inr: { type: "number" }, rationale: { type: "string" } }, required: ["opportunity_id", "stage", "rationale"] } },
 ];
 
@@ -54,7 +56,28 @@ function tableRows(s: Snapshot, table: string): Json[] {
     case "opportunities": return opportunityList(s).map((o) => ({ ...o, industry: brand.get(o.brand_id)?.industry }));
     case "opportunity_versions": return s.oppHistory.map((h) => ({ ...h }));
     case "qualification_versions": return dedupe(db.qualification, "history_id").rows.filter((q) => ts(q.effective_at) <= s.cutoff).map((q) => ({ ...q }));
-    case "payments": return db.payments.filter((p) => ts(p.invoiced_at) <= s.cutoff).map((p) => ({ ...paymentAsOf(p, s.cutoff), brand_name: brand.get(p.brand_id)?.brand_name }));
+    case "payments": {
+      const mouMap = mouStartByOpp(s);
+      return db.payments.filter((p) => ts(p.invoiced_at) <= s.cutoff).map((p) => {
+        const ps = paymentAsOf(p, s.cutoff);
+        const mouAt = mouMap.get(p.opportunity_id) ?? null;
+        const daysMouToPaid = mouAt && ps.received_as_of && ps.received_at ? calendarDaysIST(ts(mouAt), ts(ps.received_at)) : null;
+        const daysSinceMou = mouAt ? calendarDaysIST(ts(mouAt), s.cutoff) : null;
+        const daysInvoicedToPaid = ps.received_as_of && ps.received_at ? calendarDaysIST(ts(p.invoiced_at), ts(ps.received_at)) : null;
+        const exceeded15 = p.installment === "advance" && ps.status_as_of !== "void"
+          ? (daysMouToPaid !== null ? daysMouToPaid > 15 : (daysSinceMou !== null && daysSinceMou > 15))
+          : null;
+        return {
+          ...ps,
+          brand_name: brand.get(p.brand_id)?.brand_name,
+          mou_at: mouAt,
+          days_mou_to_paid: daysMouToPaid,
+          days_since_mou: daysSinceMou,
+          days_invoiced_to_paid: daysInvoicedToPaid,
+          exceeded_15_days_from_mou: exceeded15,
+        };
+      });
+    }
     case "tasks": return taskView(s) as unknown as Json[];
     case "campaigns": { const plan = new Map(db.campaign_plan.map((p) => [p.sponsor_campaign_id, p])); return db.campaigns.map((c) => ({ ...c, simulated_budget_inr: plan.get(c.sponsor_campaign_id)?.budget_inr, simulated_planned_hours: plan.get(c.sponsor_campaign_id)?.planned_hours })); }
     case "activations": return db.activations.filter((a) => ts(a.linked_at) <= s.cutoff).map((a) => ({ ...a }));
@@ -130,6 +153,42 @@ export function queryRecords(s: Snapshot, a: { table: string; filters?: { field:
   return { table: a.table, as_of: s.asOf, matched_rows: rows.length, rows: rows.slice(0, limit), truncated: rows.length > limit, available_fields: fields };
 }
 
+function ownerWorkloadSummary(s: Snapshot) {
+  const rows = ownerRows(s);
+  const byBrandOwnership = [...rows]
+    .sort((a, b) => b.brands_owned - a.brands_owned || b.opportunities - a.opportunities || a.key.localeCompare(b.key))
+    .map((r) => ({
+      owner_id: r.key,
+      owner_name: r.label,
+      brands_owned: r.brands_owned,
+      brands_owned_share: r.brands_owned_share,
+      brands_touched: r.brands_touched,
+      opportunities: r.opportunities,
+      confirmed: r.confirmed,
+    }));
+  const totalOpportunities = byBrandOwnership.reduce((sum, x) => sum + x.opportunities, 0);
+  const dealOwners = byBrandOwnership.filter((x) => x.opportunities > 0);
+  const topBrandOwner = byBrandOwnership[0];
+  const topOwnerInteractions = topBrandOwner ? s.interactions.filter((r) => r.owner_id === topBrandOwner.owner_id) : [];
+  const topOwnerColdCount = topOwnerInteractions.filter((r) => !WARM_CHANNELS.has(r.channel)).length;
+  const mostlyCold = topOwnerInteractions.length > 0 && topOwnerColdCount / topOwnerInteractions.length > 0.5;
+  const dealOwnersNote = totalOpportunities > 0
+    ? `Meanwhile the ${totalOpportunities} opportunit${totalOpportunities === 1 ? "y" : "ies"} ${totalOpportunities === 1 ? "sits" : "sit"} across ${dealOwners.length} deal owner${dealOwners.length === 1 ? "" : "s"} (${dealOwners.map((x) => `${x.owner_name}: ${x.opportunities} opp${x.opportunities === 1 ? "" : "s"}`).join(", ")}).`
+    : "Meanwhile 0 opportunities exist across 0 deal owners at this date.";
+  const overload_note = s.brandsVisible.size === 0
+    ? (totalOpportunities > 0 ? `0 brands exist at this date. ${dealOwnersNote}` : "")
+    : topBrandOwner
+      ? `${topBrandOwner.owner_name} (${topBrandOwner.owner_id}) holds ${topBrandOwner.brands_owned} of ${s.brandsVisible.size} brands (${Math.round((topBrandOwner.brands_owned_share ?? 0) * 100)}%)${mostlyCold ? ", mostly cold outbound," : ","} with ${topBrandOwner.opportunities} opportunit${topBrandOwner.opportunities === 1 ? "y" : "ies"} and ${topBrandOwner.confirmed} confirmed. ${dealOwnersNote}`
+      : "";
+  return {
+    total_brands_owned: s.brandsVisible.size,
+    total_opportunities: totalOpportunities,
+    deal_owners: dealOwners.length,
+    brand_ownership_by_owner: byBrandOwnership,
+    overload_note,
+  };
+}
+
 // ------------------------------------------------------------------ executor
 export function runTool(db: DB, name: string, args: Json, defaultAsOf: string): { result: unknown; proposal?: Proposal } {
   if (args.as_of !== undefined && args.as_of !== null && args.as_of !== "" && !parseAsOf(args.as_of))
@@ -137,28 +196,59 @@ export function runTool(db: DB, name: string, args: Json, defaultAsOf: string): 
   const asOf = parseAsOf(args.as_of) ?? defaultAsOf;
   const S = () => snapshot(db, asOf);
   switch (name) {
-    case "get_kpis": return { result: kpis(S()) };
+    case "get_kpis": {
+      const s = S();
+      return {
+        result: {
+          ...kpis(s),
+          stalled_open_opportunities: bottlenecks(s).stalled_open_opportunities,
+          owner_workload_summary: ownerWorkloadSummary(s),
+        },
+      };
+    }
     case "get_funnel": {
       const s = S();
       const g = ((args.group_by as string) ?? "campaign") as "campaign" | "owner" | "industry" | "channel_group";
       const rows = g === "owner" ? ownerRows(s) : funnelRows(s, g);
-      return { result: { as_of: s.asOf, group_by: g, rows: g === "campaign" ? rows.map((r) => ({ ...r, ...scaleChangeStop(r as ReturnType<typeof funnelRows>[number]) })) : rows, note: "Rates are brand-level (distinct brands), not attempts. simulated_* fields come from the SIMULATED campaign_plan." } };
+      return {
+        result: {
+          as_of: s.asOf,
+          group_by: g,
+          ...(g === "owner" ? { owner_workload_summary: ownerWorkloadSummary(s) } : {}),
+          rows: g === "campaign" ? rows.map((r) => ({ ...r, ...scaleChangeStop(r as ReturnType<typeof funnelRows>[number]) })) : rows,
+          note: g === "industry"
+            ? "Grouped by 2025 dataset brands.industry (brand sectors), NOT 2027 fest vertical titles. Rates are brand-level."
+            : "Rates are brand-level (distinct brands), not attempts. simulated_* fields come from the SIMULATED campaign_plan.",
+        },
+      };
     }
     case "diagnose_campaigns": {
       const s = S();
-      return { result: { as_of: s.asOf, ...bottlenecks(s), rules: "SCALE if brand->confirmed >= 30%; STOP if >=20 brands & 0 confirmed with >=5 opportunities, or meeting rate <10% after >=50 sends; TOO_EARLY if <8 brands; else CHANGE.", stalled_list: stalled(s).slice(0, 30) } };
+      return {
+        result: {
+          as_of: s.asOf,
+          scope_note: "Evaluates the 6 historical 2025 campaigns (SC01-SC06) by brand close-rate rules. For 2027 strategic bets and 120%/70% thresholds, call get_bet_signals and get_2027_plan. Stalled deals below are OPEN pipeline opportunities idle >14 days (not confirmed payment invoices).",
+          ...bottlenecks(s),
+          owner_workload_summary: ownerWorkloadSummary(s),
+          rules: "SCALE if brand->confirmed >= 30%; STOP if >=20 brands & 0 confirmed with >=5 opportunities, or meeting rate <10% after >=50 sends; TOO_EARLY if <8 brands; else CHANGE.",
+          stalled_list: stalled(s).slice(0, 30),
+        },
+      };
     }
     case "list_opportunities": {
       const s = S();
       const rows = opportunityList(s, { stage: args.stage as string, campaign: args.campaign as string, owner: args.owner as string, support_type: args.support_type as string, brand: args.brand as string, open_only: args.open_only as boolean, min_value: args.min_value as number });
-      const lim = Math.min(Number(args.limit ?? 60), 100);
+      const lim = Math.min(Number(args.limit ?? 40), 100);
       const by_stage: Record<string, { count: number; proposed_inr: number; confirmed_inr: number }> = {};
+      const by_channel_group: Record<string, { count: number; proposed_inr: number; confirmed_inr: number }> = {};
       for (const r of rows) {
         const b = (by_stage[r.stage] ??= { count: 0, proposed_inr: 0, confirmed_inr: 0 });
         b.count++; b.proposed_inr += r.proposed_value_inr; b.confirmed_inr += r.confirmed_value_inr;
+        const cg = (by_channel_group[r.channel_group] ??= { count: 0, proposed_inr: 0, confirmed_inr: 0 });
+        cg.count++; cg.proposed_inr += r.proposed_value_inr; cg.confirmed_inr += r.confirmed_value_inr;
       }
       return { result: { as_of: s.asOf, count: rows.length, total_proposed_inr: rows.reduce((a, r) => a + r.proposed_value_inr, 0), total_confirmed_inr: rows.reduce((a, r) => a + r.confirmed_value_inr, 0),
-        by_stage, totals_note: "Quote count/total/by_stage figures exactly; never add row values by hand (use calculate for any other sum).", rows: rows.slice(0, lim), truncated: rows.length > lim } };
+        by_stage, by_channel_group, totals_note: "Quote count/total/by_stage/by_channel_group figures exactly; never add row values by hand (use calculate for any other sum).", rows: rows.slice(0, lim), truncated: rows.length > lim } };
     }
     case "get_brand": {
       const s = S();
@@ -172,7 +262,21 @@ export function runTool(db: DB, name: string, args: Json, defaultAsOf: string): 
     case "forecast": {
       const f = forecast(S(), { close_ids: args.close_opportunity_ids as string[] | undefined, drop_ids: args.drop_opportunity_ids as string[] | undefined });
       const bt = forecastBacktest(db, ["2025-02-15", "2025-03-01", "2025-03-15", "2025-04-01"]);
-      return { result: { as_of: asOf, ...f, open: f.open.slice(0, 40), reliability_backtest: { ...bt, note: "Projection made at each date vs actual confirmed on the event eve. Pipeline forecasts cannot see deals not yet created, so early dates under-forecast." } } };
+      const p15 = bt.points.find((p) => p.as_of === "2025-03-15");
+      const p01 = bt.points.find((p) => p.as_of === "2025-04-01");
+      const { open, ...rest } = f;
+      return {
+        result: {
+          as_of: asOf,
+          ...rest,
+          reliability_backtest: {
+            summary: `15 Mar forecast: ${p15?.projected} projected vs ${bt.actual_confirmed_at_event_eve} actual confirmed (${p15 && p15.error !== null && p15.error >= 0 ? "+" : ""}${p15?.error}); 1 Apr forecast: ${p01?.projected} vs ${bt.actual_confirmed_at_event_eve} actual.`,
+            ...bt,
+            note: "Projection made at each date vs actual confirmed on the event eve. Pipeline forecasts cannot see deals not yet created, so early dates under-forecast.",
+          },
+          open: open.slice(0, 40),
+        },
+      };
     }
     case "get_cash_collection": return { result: { as_of: asOf, ...cashCollection(S()) } };
     case "compare_dates": {
@@ -180,10 +284,10 @@ export function runTool(db: DB, name: string, args: Json, defaultAsOf: string): 
       if (!da || !dbb) return { result: { error: "date_a and date_b must be real dates as YYYY-MM-DD." } };
       const a = kpis(snapshot(db, da)), b = kpis(snapshot(db, dbb));
       const keys = ["qualified_brands", "confirmed_partnerships", "confirmed_value_inr", "confirmed_cash_type_value_inr", "open_opportunities", "open_pipeline_proposed_inr", "lost_or_withdrawn", "brands_contacted", "outreach_attempts", "replies", "meetings_held"] as const;
-      return { result: { date_a: a.as_of, date_b: b.as_of, targets_a: a.targets, targets_b: b.targets, deltas: Object.fromEntries(keys.map((k) => [k, { a: a[k], b: b[k], change: (b[k] as number) - (a[k] as number) }])), stages_a: a.opportunities_by_stage, stages_b: b.opportunities_by_stage } };
+      return { result: { date_a: a.as_of, date_b: b.as_of, targets_a: a.targets, targets_b: a.targets, deltas: Object.fromEntries(keys.map((k) => [k, { a: a[k], b: b[k], change: (b[k] as number) - (a[k] as number) }])), stages_a: a.opportunities_by_stage, stages_b: b.opportunities_by_stage } };
     }
     case "get_trend": return { result: { as_of: asOf, weekly: weeklySeries(db, asOf) } };
-    case "get_targets": return { result: { versions: db.targets, note: "The version in force at a date is the latest with effective_at <= that date." } };
+    case "get_targets": return { result: { as_of: asOf, versions: db.targets, note: "These are 2025 partnership-count targets (latest with effective_at <= as_of). For 2027 cash targets (₹54.1L base, ₹42.0L-₹65.8L likely range, ₹1.27 Cr stretch), call get_2027_plan." } };
     case "get_tasks": return { result: { as_of: asOf, tasks: taskView(S(), { status: args.status as string, owner: args.owner as string, overdue_only: args.overdue_only as boolean }) } };
     case "query_records": return { result: queryRecords(S(), args as never) };
     case "calculate": {
@@ -192,18 +296,24 @@ export function runTool(db: DB, name: string, args: Json, defaultAsOf: string): 
     }
     case "data_dictionary": {
       const d = dataDictionary(db);
-      return { result: { ...d, field_guide: d.field_guide.map((f) => `${f.source_table}.${f.field}: ${f.meaning}`) } };
+      return { result: { as_of: asOf, ...d, field_guide: d.field_guide.map((f) => `${f.source_table}.${f.field}: ${f.meaning}`) } };
     }
-    case "get_2027_plan": return { result: plan2027() };
+    case "get_2027_plan": return { result: { dashboard_as_of: asOf, ...plan2027() } };
     case "get_bet_signals": return { result: betSignals(S()) };
+    case "search_strategy_docs": return { result: { dashboard_as_of: asOf, ...searchKnowledge(String(args.query ?? ""), Number(args.top_k ?? 4)) } };
     case "propose_task": {
       const warnings: string[] = [];
-      const owners = new Set(snapshot(db, asOf).owners.keys());
+      const s = S();
+      const owners = new Set(s.owners.keys());
       if (args.owner_id && !owners.has(String(args.owner_id))) warnings.push(`Unknown owner ${args.owner_id}`);
       if (args.brand_id && !db.brands.some((b) => b.brand_id === args.brand_id)) warnings.push(`Unknown brand ${args.brand_id}`);
       if (args.opportunity_id && !db.opportunities.some((o) => o.opportunity_id === args.opportunity_id)) warnings.push(`Unknown opportunity ${args.opportunity_id}`);
+      const oppStage = args.opportunity_id ? s.oppLatest.get(String(args.opportunity_id))?.stage ?? null : null;
+      const brandOpps = args.brand_id ? [...s.oppLatest.values()].filter((h) => h.brand_id === String(args.brand_id)) : [];
+      const brandHasOpenOpp = brandOpps.some((h) => OPEN_STAGES.includes(h.stage));
+      const brandHasConfirmedOpp = brandOpps.some((h) => h.stage === "partner_confirmed");
       const payload = { title: args.title, description: args.description ?? "", owner_id: args.owner_id ?? null, due_date: args.due_date ?? null, priority: args.priority ?? "medium", brand_id: args.brand_id ?? null, opportunity_id: args.opportunity_id ?? null, sponsor_campaign_id: args.sponsor_campaign_id ?? null, source: "copilot" };
-      return { result: { status: "DRAFT_ONLY_NOT_SAVED", message: "Shown to the user with a Confirm button. Tell the user to review and confirm; do not claim it was created.", draft: payload, warnings }, proposal: { kind: "task", payload, rationale: String(args.rationale ?? ""), warnings } };
+      return { result: { status: "DRAFT_ONLY_NOT_SAVED", message: "Shown to the user with a Confirm button. Tell the user to review and confirm; do not claim it was created.", opportunity_stage: oppStage, brand_has_open_opp: brandHasOpenOpp, brand_has_confirmed_opp: brandHasConfirmedOpp, draft: payload, warnings }, proposal: { kind: "task", payload, rationale: String(args.rationale ?? ""), warnings } };
     }
     case "propose_opportunity_update": {
       const warnings: string[] = [];
@@ -218,3 +328,4 @@ export function runTool(db: DB, name: string, args: Json, defaultAsOf: string): 
     default: return { result: { error: `Unknown tool ${name}` } };
   }
 }
+

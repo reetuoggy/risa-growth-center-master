@@ -189,6 +189,11 @@ export function funnelRows(s: Snapshot, groupBy: "campaign" | "owner" | "industr
     groups.get(k)!.push(r);
   }
   for (const h of s.oppLatest.values()) { const k = keyOfOpp(h); if (!groups.has(k)) groups.set(k, []); }
+  if (groupBy === "owner") {
+    for (const b of s.db.brands) {
+      if (s.brandsVisible.has(b.brand_id) && b.owner_id && !groups.has(b.owner_id)) groups.set(b.owner_id, []);
+    }
+  }
   const plan = new Map(s.db.campaign_plan.map((p) => [p.sponsor_campaign_id, p]));
   const rows = [...groups.entries()].map(([k, I]) => {
     const brands = new Set(I.map((r) => r.brand_id));
@@ -331,20 +336,81 @@ export function forecastBacktest(db: DB, dates: string[]) {
 // ------------------------------------------------------------------ stalled deals & bottlenecks
 export function stalled(s: Snapshot, days = 14) {
   return [...s.oppLatest.values()].filter((h) => OPEN_STAGES.includes(h.stage) && (s.cutoff - ts(h.effective_at)) / DAY > days)
-    .map((h) => ({ opportunity_id: h.opportunity_id, brand: h.brand_name, stage: h.stage, days_in_stage: Math.floor((s.cutoff - ts(h.effective_at)) / DAY), proposed_value_inr: h.proposed_value_inr, owner: h.owner_name, campaign: s.campaignsById.get(s.opps.get(h.opportunity_id)!.sponsor_campaign_id)?.campaign_name }))
+    .map((h) => {
+      const o = s.opps.get(h.opportunity_id)!;
+      const c = s.campaignsById.get(o.sponsor_campaign_id);
+      const channel = c?.channel ?? null;
+      return {
+        opportunity_id: h.opportunity_id,
+        brand_id: h.brand_id,
+        brand: h.brand_name,
+        stage: h.stage,
+        days_in_stage: Math.floor((s.cutoff - ts(h.effective_at)) / DAY),
+        proposed_value_inr: h.proposed_value_inr,
+        owner_id: h.owner_id,
+        owner: h.owner_name,
+        sponsor_campaign_id: o.sponsor_campaign_id,
+        campaign: c?.campaign_name,
+        channel,
+        channel_group: WARM_CHANNELS.has(channel ?? "") ? "warm/inbound" : "cold outbound",
+      };
+    })
     .sort((a, b) => b.proposed_value_inr - a.proposed_value_inr);
 }
 
 export function bottlenecks(s: Snapshot) {
   const rows = funnelRows(s, "campaign");
   const st = stalled(s);
+  const byChannelGroup: Record<string, { count: number; value_inr: number; value_lakh: number }> = {
+    "cold outbound": { count: 0, value_inr: 0, value_lakh: 0 },
+    "warm/inbound": { count: 0, value_inr: 0, value_lakh: 0 },
+  };
+  for (const x of st) {
+    const g = (byChannelGroup[x.channel_group] ??= { count: 0, value_inr: 0, value_lakh: 0 });
+    g.count++;
+    g.value_inr += x.proposed_value_inr;
+  }
+  for (const g of Object.values(byChannelGroup)) g.value_lakh = round(g.value_inr / 1e5, 1) as number;
   return {
     by_campaign: rows.map((r) => ({ campaign: r.label, ...scaleChangeStop(r), weakest_step: weakestStep(r), open_pipeline_inr: r.open_pipeline_inr })),
-    stalled_open_opportunities: { count: st.length, value_inr: sum(st.map((x) => x.proposed_value_inr)), by_stage: st.reduce<Record<string, number>>((a, x) => ((a[x.stage] = (a[x.stage] ?? 0) + 1), a), {}) },
+    stalled_open_opportunities: {
+      count: st.length,
+      value_inr: sum(st.map((x) => x.proposed_value_inr)),
+      value_lakh: round(sum(st.map((x) => x.proposed_value_inr)) / 1e5, 1) as number,
+      by_stage: st.reduce<Record<string, number>>((a, x) => ((a[x.stage] = (a[x.stage] ?? 0) + 1), a), {}),
+      by_channel_group: byChannelGroup,
+    },
   };
 }
 
 // ------------------------------------------------------------------ cash (SIMULATED payments layer)
+/** Calendar days in IST between two timestamps (ms). */
+export function calendarDaysIST(fromMs: number, toMs: number): number {
+  const d1 = Date.parse(`${istDate(fromMs)}T12:00:00+05:30`);
+  const d2 = Date.parse(`${istDate(toMs)}T12:00:00+05:30`);
+  return Math.round((d2 - d1) / DAY);
+}
+
+/** MoU signing timestamp (earliest partner_confirmed in the active confirmation streak, or latest partner_confirmed <= cutoff). */
+export function mouStartByOpp(s: Snapshot): Map<string, string> {
+  const byOpp = new Map<string, OppHistory[]>();
+  for (const h of s.oppHistory) {
+    if (!byOpp.has(h.opportunity_id)) byOpp.set(h.opportunity_id, []);
+    byOpp.get(h.opportunity_id)!.push(h);
+  }
+  const out = new Map<string, string>();
+  for (const [id, hs] of byOpp) {
+    hs.sort((a, b) => ts(a.effective_at) - ts(b.effective_at) || a.history_id.localeCompare(b.history_id));
+    let firstStreak: OppHistory | null = null;
+    for (let i = hs.length - 1; i >= 0; i--) {
+      if (hs[i].stage === "partner_confirmed") firstStreak = hs[i];
+      else if (firstStreak) break;
+    }
+    if (firstStreak) out.set(id, firstStreak.effective_at);
+  }
+  return out;
+}
+
 /** A payment as it looked at the cutoff: receipts / voids after the cutoff are hidden (no look-ahead). */
 export function paymentAsOf(p: Payment, cutoff: number) {
   const received = p.received_at !== null && ts(p.received_at) <= cutoff;
@@ -357,6 +423,51 @@ export function cashCollection(s: Snapshot) {
   const ev = s.db.event[0];
   const t14 = eodIST(istDate(ts(ev.event_starts_at) - 14 * DAY)); // whole T-14 day counts
   const overdue = P.filter((p) => !recv(p) && ts(p.due_at) < s.cutoff);
+  const mouMap = mouStartByOpp(s);
+  const brandName = (id: string) => s.db.brands.find((b) => b.brand_id === id)?.brand_name;
+
+  const advRows = P.filter((p) => p.installment === "advance").map((p) => {
+    const mouAt = mouMap.get(p.opportunity_id) ?? p.invoiced_at;
+    const isRecv = recv(p);
+    const isOverdue = !isRecv && ts(p.due_at) < s.cutoff;
+    const daysMouToPaid = isRecv ? calendarDaysIST(ts(mouAt), ts(p.received_at!)) : null;
+    const daysSinceMou = calendarDaysIST(ts(mouAt), s.cutoff);
+    const exceeded15 = isRecv ? (daysMouToPaid! > 15) : (daysSinceMou > 15);
+    return {
+      payment_id: p.payment_id,
+      opportunity_id: p.opportunity_id,
+      brand: brandName(p.brand_id),
+      amount_inr: p.amount_inr,
+      mou_at: mouAt.slice(0, 10),
+      invoiced_at: p.invoiced_at.slice(0, 10),
+      due_at: p.due_at.slice(0, 10),
+      received_at: isRecv ? p.received_at!.slice(0, 10) : null,
+      days_mou_to_paid: daysMouToPaid,
+      days_since_mou: isRecv ? daysMouToPaid : daysSinceMou,
+      status: isRecv ? (exceeded15 ? "paid_after_15_days" : "paid_within_15_days") : isOverdue ? "overdue_unpaid" : "open_unpaid",
+      exceeded_15_days: exceeded15,
+    };
+  });
+  const paidAdv = advRows.filter((r) => r.days_mou_to_paid !== null);
+  const unpaidAdv = advRows.filter((r) => r.days_mou_to_paid === null);
+  const paidDays = paidAdv.map((r) => r.days_mou_to_paid!).sort((a, b) => a - b);
+  const mid = paidDays.length ? Math.floor(paidDays.length / 2) : 0;
+  const medianPaid = paidDays.length ? (paidDays.length % 2 ? paidDays[mid] : (paidDays[mid - 1] + paidDays[mid]) / 2) : null;
+  const exceededList = advRows.filter((r) => r.exceeded_15_days).sort((a, b) => (b.days_since_mou ?? 0) - (a.days_since_mou ?? 0));
+
+  const confirmedAll = [...s.oppLatest.values()].filter((h) => h.stage === "partner_confirmed");
+  const isSplit5050 = (oppId: string) => {
+    const rows = P.filter((p) => p.opportunity_id === oppId);
+    return rows.some((p) => p.installment === "advance") && rows.some((p) => p.installment === "balance");
+  };
+  const isUpfront100 = (oppId: string, confirmedInr: number) => {
+    const rows = P.filter((p) => p.opportunity_id === oppId);
+    return rows.length === 1 && rows[0].amount_inr >= confirmedInr && confirmedInr > 0;
+  };
+  const cashConfirmed = confirmedAll.filter((h) => s.opps.get(h.opportunity_id)?.support_type === "cash");
+  const sc04Confirmed = confirmedAll.filter((h) => s.opps.get(h.opportunity_id)?.sponsor_campaign_id === "SC04");
+  const sc04Cash = sc04Confirmed.filter((h) => s.opps.get(h.opportunity_id)?.support_type === "cash");
+
   return {
     is_simulated: true,
     note: "Payments are SIMULATED (the source dataset has no bank-receipt data). Policy modelled: 50% advance at confirmation, balance invoiced +7 days, 2% TDS deducted. Confirming a cash deal in the app creates its invoices; moving it out of confirmed voids unpaid ones.",
@@ -371,7 +482,43 @@ export function cashCollection(s: Snapshot) {
       t14_date: istDate(t14),
       is_simulated: true,
     },
-    overdue: overdue.map((p) => ({ payment_id: p.payment_id, opportunity_id: p.opportunity_id, brand: s.db.brands.find((b) => b.brand_id === p.brand_id)?.brand_name, installment: p.installment, amount_inr: p.amount_inr, due: p.due_at.slice(0, 10) })),
+    payment_terms_summary: {
+      all_cash_confirmed_deals: cashConfirmed.length,
+      split_50_50_deals: cashConfirmed.filter((h) => isSplit5050(h.opportunity_id)).length,
+      paid_100_pct_upfront_deals: cashConfirmed.filter((h) => isUpfront100(h.opportunity_id, h.confirmed_value_inr)).length,
+      sc04_store_proxy_confirmed_deals: sc04Confirmed.length,
+      sc04_cash_50_50_deals: sc04Cash.filter((h) => isSplit5050(h.opportunity_id)).length,
+      sc04_in_kind_deals: sc04Confirmed.length - sc04Cash.length,
+      sc04_paid_100_pct_upfront_deals: sc04Cash.filter((h) => isUpfront100(h.opportunity_id, h.confirmed_value_inr)).length,
+    },
+    mou_to_advance: {
+      target_days: 15,
+      metric_definition: "Calendar days from MoU date (partner_confirmed effective_at) to advance payment received (or days elapsed since MoU if unpaid) — distinct from invoice due_at.",
+      total_advances: advRows.length,
+      paid_count: paidAdv.length,
+      unpaid_count: unpaidAdv.length,
+      paid_median_days: medianPaid,
+      paid_min_days: paidDays.length ? paidDays[0] : null,
+      paid_max_days: paidDays.length ? paidDays[paidDays.length - 1] : null,
+      paid_exceeded_15_days_count: paidAdv.filter((r) => r.exceeded_15_days).length,
+      unpaid_exceeded_15_days_count: unpaidAdv.filter((r) => r.exceeded_15_days).length,
+      total_exceeded_15_days_count: exceededList.length,
+      exceeded_15_days_list: exceededList,
+    },
+    overdue: overdue.map((p) => {
+      const mouAt = mouMap.get(p.opportunity_id);
+      return {
+        payment_id: p.payment_id,
+        opportunity_id: p.opportunity_id,
+        brand: brandName(p.brand_id),
+        installment: p.installment,
+        amount_inr: p.amount_inr,
+        due: p.due_at.slice(0, 10),
+        mou_at: mouAt ? mouAt.slice(0, 10) : null,
+        days_since_mou: mouAt ? calendarDaysIST(ts(mouAt), s.cutoff) : null,
+        days_overdue: calendarDaysIST(ts(p.due_at), s.cutoff),
+      };
+    }),
   };
 }
 
@@ -406,7 +553,15 @@ export function opportunityList(s: Snapshot, f: { stage?: string; campaign?: str
   return [...s.oppLatest.values()].map((h) => {
     const o = s.opps.get(h.opportunity_id)!;
     const c = s.campaignsById.get(o.sponsor_campaign_id);
-    return { opportunity_id: h.opportunity_id, brand: h.brand_name, brand_id: h.brand_id, stage: h.stage, proposed_value_inr: h.proposed_value_inr, confirmed_value_inr: h.confirmed_value_inr, support_type: o.support_type, campaign: c?.campaign_name ?? o.originating_campaign_name, sponsor_campaign_id: o.sponsor_campaign_id, channel: c?.channel, owner: h.owner_name, owner_id: h.owner_id, last_change: h.effective_at, days_in_stage: Math.floor((s.cutoff - ts(h.effective_at)) / DAY), created_at: o.created_at };
+    const channel = c?.channel;
+    return {
+      opportunity_id: h.opportunity_id, brand: h.brand_name, brand_id: h.brand_id, stage: h.stage,
+      proposed_value_inr: h.proposed_value_inr, confirmed_value_inr: h.confirmed_value_inr, support_type: o.support_type,
+      campaign: c?.campaign_name ?? o.originating_campaign_name, sponsor_campaign_id: o.sponsor_campaign_id,
+      channel, channel_group: WARM_CHANNELS.has(channel ?? "") ? "warm/inbound" : "cold outbound",
+      owner: h.owner_name, owner_id: h.owner_id, last_change: h.effective_at,
+      days_in_stage: Math.floor((s.cutoff - ts(h.effective_at)) / DAY), created_at: o.created_at,
+    };
   }).filter((r) =>
     (!f.stage || r.stage === f.stage) &&
     (!f.campaign || lc(r.campaign).includes(lc(f.campaign)) || r.sponsor_campaign_id === f.campaign) &&
@@ -456,12 +611,19 @@ export function taskView(s: Snapshot, f: { status?: string; owner?: string; over
 export function ownerRows(s: Snapshot) {
   const rows = funnelRows(s, "owner");
   const tasks = taskView(s);
-  return rows.map((r) => ({
-    ...r,
-    brands_owned: s.db.brands.filter((b) => b.owner_id === r.key && s.brandsVisible.has(b.brand_id)).length,
-    open_tasks: tasks.filter((t) => t.owner_id === r.key && t.status !== "done").length,
-    overdue_tasks: tasks.filter((t) => t.owner_id === r.key && t.overdue).length,
-  }));
+  const totalBrands = s.brandsVisible.size;
+  return rows.map((r) => {
+    const brandsOwned = s.db.brands.filter((b) => b.owner_id === r.key && s.brandsVisible.has(b.brand_id)).length;
+    const distinctOppBrands = new Set([...s.oppLatest.values()].filter((h) => h.owner_id === r.key).map((h) => h.brand_id)).size;
+    return {
+      ...r,
+      brands_owned: brandsOwned,
+      brands_owned_share: totalBrands ? round(brandsOwned / totalBrands) : 0,
+      distinct_opp_brands: distinctOppBrands,
+      open_tasks: tasks.filter((t) => t.owner_id === r.key && t.status !== "done").length,
+      overdue_tasks: tasks.filter((t) => t.owner_id === r.key && t.overdue).length,
+    };
+  });
 }
 
 // ------------------------------------------------------------------ data dictionary (what the data can / cannot answer)
@@ -488,8 +650,13 @@ export function dataDictionary(db: DB) {
       confirmed_value: "Reported partnership value in INR incl. in-kind; NOT cash collected.",
       as_of: "End of the selected day in Asia/Kolkata; later events are invisible.",
       dedup: "Rows repeating the same interaction_id/history_id are import retries and counted once.",
+      industry_verticals_2025_vs_plan_titles_2027: "In the 2025 dataset, brands.industry has 6 brand sectors (Food and beverage, Consumer products, Mobility, Education, Media, Personal care). In the 2027 plan, 'verticals' (Bet 3 / Segment B) means unbundled fest sub-property titles (nights, hackathon, arena, summit).",
+      in_kind_2025_vs_hybrid_2027: "In 2025 data, support_type is only 'cash' or 'in_kind' (no hybrid deals exist). In the 2027 plan, 'hybrid' (Bet 5 / Segment E) is a fixed guaranteed fee + capped CPA bonus (50% guaranteed target), NOT in-kind.",
+      mou_to_advance_paid_target: "Plan metric is calendar days from MoU signing (partner_confirmed effective_at) to advance receipt (target <=15 days), distinct from invoice due_at.",
+      brand_ownership_vs_deal_ownership: "Research brand ownership (brands.owner_id across 180 brands: Kabir Shah 126, Riya Kapoor 35, Nisha Rao 19, Meera Iyer 0) differs from deal ownership (opp_history.owner_id across 58 opportunities split among Riya, Nisha, Meera).",
     },
     field_guide: db.field_guide,
     readme: db.readme,
   };
 }
+

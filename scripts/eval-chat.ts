@@ -17,10 +17,20 @@ type ChatRes = { reply: string; trace: { tool: string }[]; proposals: unknown[] 
 type Ctx = { tasksBefore: number };
 
 async function chat(messages: Msg[], asOf = "2025-04-20"): Promise<ChatRes> {
-  const r = await fetch(`${BASE}/api/chat`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ messages, as_of: asOf }) });
-  const j = await r.json();
-  if (!r.ok) throw new Error(j.error ?? r.statusText);
-  return j;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const r = await fetch(`${BASE}/api/chat`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ messages, as_of: asOf }) });
+    const j = await r.json();
+    if (r.ok) return j;
+    const err = String(j.error ?? r.statusText);
+    if (r.status === 429 || /429|RESOURCE_EXHAUSTED/i.test(err)) {
+      const m = err.match(/retry in (\d+(?:\.\d+)?)s/i);
+      const waitMs = Math.min(65_000, Math.max(15_000, (m ? Math.ceil(Number(m[1])) + 2 : 20 * (attempt + 1)) * 1000));
+      await new Promise((res) => setTimeout(res, waitMs));
+      continue;
+    }
+    throw new Error(err);
+  }
+  throw new Error("429 rate limit persisted after retries");
 }
 const api = async (path: string, method = "GET", body?: unknown) => (await fetch(`${BASE}${path}`, { method, headers: { "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined })).json();
 const taskCount = async () => (await api("/api/tasks?asOf=2025-04-20")).tasks.length as number;
@@ -65,6 +75,24 @@ const CASES: Case[] = [
   // execution (draft only, never writes without confirmation)
   { id: "E1", cat: "execution", turns: ["Draft a task for Kabir Shah to pause the Brand Discovery Email campaign and move his hours to warm introductions, due 2025-03-20."],
     check: async (r, ctx) => (r.proposals.length < 1 ? "no task proposal returned" : (await taskCount()) !== ctx.tasksBefore ? "a task was written without confirmation" : null), mustNot: [/(has been|was|successfully) (created|added|saved)/i] },
+  // deck-consistency & reworded questions (Q4..Q16)
+  { id: "K1", cat: "deck-consistency", turns: ["What are our 2027 base and stretch cash targets by T-14, and what is the likely range?"], must: [/54\.1/, /1\.27\s?Cr|127\.4/, /42\.0/, /65\.8/], mustNot: [/35\.0|50\.0\s?L/i] },
+  { id: "K2", cat: "deck-consistency", turns: ["Why did we pick Mumbai instead of Delhi NCR for CampusFest 2027?"], must: [/8\.95/, /8\.90|8\.9/, /0\.05/, /bank|UPI|NPCI|SBI/i], mustNot: [/venue partner depth|creator network density/i] },
+  { id: "K3", cat: "deck-consistency", turns: ["How are brands distributed across owners, and is anyone overloaded?"], must: [/126/, /180/, /Kabir/i] },
+  { id: "K4", cat: "deck-consistency", turns: ["How many days from MoU to advance paid? Did any advance exceed 15 days, and which payments are overdue?"], must: [/Mosaic Mobility/i, /15\s?days|15-day/i, /Aster Pantry|23/i], mustNot: [/no advance exceeded 15/i] },
+  { id: "K5", cat: "deck-consistency", turns: ["Draft tasks for our stalled deals."],
+    check: async (r, ctx) => (r.proposals.length < 1 ? "no stalled-deal task proposal returned" : (await taskCount()) !== ctx.tasksBefore ? "written without confirm" : null),
+    mustNot: [/Mosaic Mobility|invoice|PAY0\d+/i] },
+  { id: "K6", cat: "deck-consistency", turns: ["How many stalled deals do we have, what are they worth, and how do they split between cold and warm?"], must: [/\b26\b/, /14\.4/, /cold/i, /0.*warm|warm.*0/i], mustNot: [/20\.9/i] },
+  { id: "K7", cat: "deck-consistency", turns: ["How does our 2027 plan define hybrid deals? Are they in-kind with zero guaranteed cash?"], must: [/50%/, /bonus|CPA/i], mustNot: [/hybrid.*in-kind.*₹?0 guaranteed/i] },
+  { id: "K8", cat: "deck-consistency", turns: ["Judge all 5 bets using our Scale and Stop plan thresholds."], must: [/120%/, /70%/, /vertical/i, /anchor/i, /hybrid/i] },
+  { id: "K9", cat: "deck-consistency", turns: ["What is the modelled downside if no anchor sponsor signs?"], must: [/41\.0/] },
+  { id: "K10", cat: "deck-consistency", turns: ["Compare the 15 March forecast against the actual confirmed deals."], must: [/26\.9/, /\b24\b/] },
+  { id: "K11", cat: "deck-consistency", turns: ["What specific actions should we take if we miss our Week 6 and Week 9 checkpoints?"], must: [/cold/i, /re-?price|co-title/i, /100% advance/i] },
+  // reworded consistency checks
+  { id: "R1", cat: "reworded", turns: ["If D2C or quick-commerce sponsors led the mix instead of banks/UPI, which city would win?"], must: [/Delhi[- ]?NCR/i, /8\.95/, /8\.90|8\.9/] },
+  { id: "R2", cat: "reworded", turns: ["Give me the Monte Carlo P10-P90 band and stretch goal in the 2027 model."], must: [/42\.0/, /65\.8/, /1\.27\s?Cr|127\.4/] },
+  { id: "R3", cat: "reworded", turns: ["Are dataset brand industries the same as the 2027 plan's verticals?"], must: [/title|hackathon|pro-?night|arena|summit/i, /industry|Food and beverage|Mobility/i] },
 ];
 
 async function main() {
@@ -73,7 +101,8 @@ async function main() {
   await api("/api/admin/reset", "POST", { confirm: "RESET" });
   for (const c of CASES) {
     const ctx: Ctx = { tasksBefore: await taskCount() };
-    let verdict = "PASS", note = "", reply = "", tools: string[] = [];
+    let verdict = "PASS", note = "", reply = "";
+    const tools: string[] = [];
     try {
       await c.setup?.();
       const msgs: Msg[] = [];
@@ -95,7 +124,7 @@ async function main() {
     if (verdict === "PASS") pass++;
     console.log(`${c.id} [${c.cat}] ${verdict} ${note}`);
     rows.push(`### ${c.id} · ${c.cat} · **${verdict}**\n\n**Q:** ${c.turns.join("  →  ")}\n\n**Tools:** ${[...new Set(tools)].join(", ") || "none"}${note ? `\n\n**Note:** ${note}` : ""}\n\n<details><summary>Answer</summary>\n\n${reply.replace(/\n/g, "\n> ").replace(/^/, "> ")}\n\n</details>\n`);
-    await new Promise((r) => setTimeout(r, 1500)); // stay under free-tier rate limits
+    await new Promise((r) => setTimeout(r, 3000)); // stay under free-tier rate limits
   }
   await api("/api/admin/reset", "POST", { confirm: "RESET" });
   const md = `# Copilot evaluation\n\nTarget: ${BASE} · ${new Date().toISOString()}\n\n**${pass}/${CASES.length} passed** (automatic regex + structural grading)\n\n${rows.join("\n")}`;

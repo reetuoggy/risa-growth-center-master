@@ -20,9 +20,31 @@ function judge(rule: Rule, value: number, n: number): Signal {
 export function betSignals(s: Snapshot) {
   const out = [];
   for (const [key, plan] of Object.entries(BET_PLANS)) {
+    const plan_thresholds = plan.rules.map((r) => ({
+      metric: r.metric,
+      plan: r.plan,
+      scale_at: r.scale,
+      stop_below: r.stop,
+      unit: r.unit,
+      min_n: r.min_n,
+    }));
+    const actions = {
+      scale: plan.scale_action,
+      change: plan.change_action,
+      stop: plan.stop_action,
+    };
     const camps = PROXIES[key];
     if (!camps) {
-      out.push({ bet: key, signal: "NOT_MEASURABLE" as Signal, reason: "No deals in the source data are tagged to this 2027 bet; it becomes measurable once its opportunities are tagged.", metrics: [] });
+      out.push({
+        bet: key,
+        signal: "NOT_MEASURABLE" as Signal,
+        leading_indicator: plan.leading,
+        plan_thresholds,
+        actions,
+        test: plan.test,
+        reason: `Not measurable in 2025 data (no 2025 deals tagged to this 2027 bet). Judge using 2027 plan thresholds (SCALE >=120% of plan, STOP <70% of plan): ${plan.leading}. Scale: ${plan.scale_action}; Change: ${plan.change_action}; Stop: ${plan.stop_action}.`,
+        metrics: [],
+      });
       continue;
     }
     const I = s.interactions.filter((r) => camps.includes(r.sponsor_campaign_id));
@@ -36,13 +58,30 @@ export function betSignals(s: Snapshot) {
     };
     const metrics = plan.rules.map((r) => {
       const v = values[r.metric];
-      return { metric: r.metric, value: Math.round(v * 100) / 100, plan: r.plan, scale_at: r.scale, stop_below: r.stop, n: brands.size, signal: judge(r, v, brands.size) };
+      return { metric: r.metric, value: Math.round(v * 100) / 100, plan: r.plan, scale_at: r.scale, stop_below: r.stop, unit: r.unit, n: brands.size, signal: judge(r, v, brands.size) };
     });
     const sigs = metrics.map((m) => m.signal);
     const signal: Signal = sigs.every((x) => x === "TOO_EARLY") ? "TOO_EARLY" : sigs.includes("STOP") ? "STOP" : sigs.every((x) => x === "SCALE") ? "SCALE" : "CHANGE";
     const action = signal === "SCALE" ? plan.scale_action : signal === "STOP" ? plan.stop_action : signal === "CHANGE" ? plan.change_action : "Wait for the minimum sample";
-    out.push({ bet: key, proxy_campaigns: camps, signal, action, weeks_elapsed: Math.round(weeks * 10) / 10, brands: brands.size, metrics,
-      reason: metrics.map((m) => `${m.metric} ${m.value} vs scale ${m.scale_at} / stop ${m.stop_below} -> ${m.signal}`).join("; ") });
+    out.push({
+      bet: key,
+      proxy_campaigns: camps,
+      signal,
+      action,
+      leading_indicator: plan.leading,
+      plan_thresholds,
+      actions,
+      test: plan.test,
+      weeks_elapsed: Math.round(weeks * 10) / 10,
+      brands: brands.size,
+      metrics,
+      reason: metrics.map((m) => `${m.metric} ${m.value} vs plan ${m.plan} (scale >=${m.scale_at} / stop <${m.stop_below}) -> ${m.signal}`).join("; "),
+    });
   }
-  return { as_of: s.asOf, rule: "SCALE if >= 120% of plan on every metric; STOP if any metric < 70% of plan; TOO_EARLY below the minimum n; otherwise CHANGE. Thresholds come from the 2027 model (lib/plan.ts).", bets: out };
+  return {
+    as_of: s.asOf,
+    rule: "Judge all 5 bets by 2027 plan thresholds (NOT 2025 campaign close rates): SCALE if >= 120% of plan on every metric; STOP if any metric < 70% of plan; TOO_EARLY below minimum n; NOT_MEASURABLE if no 2025 deals are tagged yet (still report their 2027 plan thresholds); otherwise CHANGE.",
+    bets: out,
+  };
 }
+
