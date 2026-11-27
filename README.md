@@ -207,7 +207,6 @@ python -I model/build_model.py                       # regenerate the model, wor
 | [Vercel](https://vercel.com) (Hobby) | Hosting | — |
 | Python ([pandas](https://pandas.pydata.org), [xlsxwriter](https://xlsxwriter.readthedocs.io)) | Data verification and the model | All numbers cross-checked against the TypeScript engine via pinned tests |
 | [Playwright](https://playwright.dev), [python-pptx](https://python-pptx.readthedocs.io), [Canva](https://www.canva.com) (Pro) | Screenshots and the deck | Deck generated from `data/model_output.json`, so slide numbers equal the model |
-| [Claude Code](https://claude.com/claude-code) (AI coding assistant) | Pair-programmed the build, ran the web research (each claim adversarially fact-checked; refuted claims dropped) and an adversarial rubric review | Every number and decision reviewed by me; research with URLs and confidence per claim in [research/fact_base.md](research/fact_base.md) |
 
 ---
 
