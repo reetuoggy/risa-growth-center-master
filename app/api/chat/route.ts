@@ -9,8 +9,8 @@ import { buildTurnRoutingCue, detectStalledTaskMismatch, isStalledTaskRequest, i
 export const maxDuration = 120;
 
 // Primary model first; on overload (503/429) fall back down the chain. Once a model answers,
-// the rest of the request sticks to it (tool-call turns are not mixed across models).
-const MODELS = (process.env.GEMINI_MODEL || "gemini-4-hydrogen,gemini-3.8-flash,gemini-3.5-flash-lite")
+// the rest of the request sticks to it unless it hits rate-limit/overload mid-turn.
+const MODELS = (process.env.GEMINI_MODEL || "gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.5-flash,gemini-4-hydrogen,gemini-3.8-flash")
   .split(",").map((s) => s.trim()).filter(Boolean);
 const MAX_ROUNDS = 8;
 const clip = (x: unknown, n = 40000) => { const s = JSON.stringify(x); return s.length > n ? { truncated: true, preview: s.slice(0, n) } : x; };
@@ -19,24 +19,30 @@ type Msg = { role: "user" | "assistant"; content: string };
 
 // Overloaded, rate-limited or hung (our own per-call timeout) all mean "try the next model".
 const BUSY = /429|RESOURCE_EXHAUSTED|503|UNAVAILABLE|overloaded|high demand|abort|timed? ?out/i;
+const DAILY_QUOTA = /PerDay|GenerateRequestsPerDay/i;
 // A fallback candidate gets a short leash (a busy model can hang 45 s+); the model in use gets longer.
 const CANDIDATE_TIMEOUT_MS = 10_000;
 const STICKY_TIMEOUT_MS = 30_000;
 
-// Per-instance memory of overloaded models, so later requests skip straight to one that answers.
-const COOLDOWN_MS = 120_000;
+// Per-instance memory of overloaded/exhausted models, so later requests skip straight to healthy ones.
+const COOLDOWN_MS = 30_000;
+const DAILY_COOLDOWN_MS = 6 * 3600_000;
 const busyUntil = new Map<string, number>();
 
 async function generate(ai: GoogleGenAI, contents: Content[], system: string, state: { model?: string }, forceTool = false) {
   const now = Date.now();
   const fresh = MODELS.filter((m) => (busyUntil.get(m) ?? 0) <= now);
-  const chain = state.model ? [state.model] : (fresh.length ? fresh : MODELS);
+  const recoverable = MODELS.filter((m) => !fresh.includes(m) && (busyUntil.get(m) ?? 0) - now <= COOLDOWN_MS);
+  const candidates = fresh.length ? [...fresh, ...recoverable] : (recoverable.length ? recoverable : MODELS);
+  const chain = state.model
+    ? [state.model, ...candidates.filter((m) => m !== state.model)]
+    : candidates;
   let last: unknown;
   for (const model of chain) {
-    const sticky = !!state.model;
-    // Fallback candidates get one quick try; the model already in use gets patient retries.
+    const sticky = model === state.model;
     const isLast = model === chain[chain.length - 1];
-    for (let attempt = 0; attempt < (sticky ? 3 : isLast ? 2 : 1); attempt++) {
+    const maxAttempts = sticky ? 2 : isLast ? 2 : 1;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const invoke = (useForce: boolean) => ai.models.generateContent({
         model, contents,
         config: {
@@ -67,10 +73,12 @@ async function generate(ai: GoogleGenAI, contents: Content[], system: string, st
         const errMsg = String((last as Error).message ?? last);
         const notFound = /404|NOT_FOUND|no longer available/i.test(errMsg);
         if (!BUSY.test(errMsg) && !notFound) throw last;
-        if (!sticky) busyUntil.set(model, Date.now() + (notFound ? 24 * 3600_000 : COOLDOWN_MS));
-        if (notFound) break;
-        if (!sticky && !isLast) break;
-        await new Promise((r) => setTimeout(r, 1200 * (attempt + 1)));
+        const cooldown = notFound ? 24 * 3600_000 : DAILY_QUOTA.test(errMsg) ? DAILY_COOLDOWN_MS : COOLDOWN_MS;
+        busyUntil.set(model, Date.now() + cooldown);
+        if (notFound || DAILY_QUOTA.test(errMsg)) break;
+        if (!isLast && attempt === maxAttempts - 1) break;
+        if (!isLast && !sticky) break;
+        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
       }
     }
   }

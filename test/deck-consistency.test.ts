@@ -1008,5 +1008,27 @@ describe("Audit fixes: dynamic ownerWorkloadSummary, early funnelRows(owner), an
     expect(chainRes.proposals).toHaveLength(1);
     expect(chainRes.proposals[0].payload.opportunity_id).toBe("O028");
   });
+
+  it("falls back to next model when sticky model hits daily 429 quota mid-turn", async () => {
+    const { POST } = await import("../app/api/chat/route");
+    mockGenerateContent
+      .mockResolvedValueOnce({
+        functionCalls: [{ id: "c1", name: "get_2027_plan", args: {} }],
+        candidates: [{ content: { role: "model", parts: [{ functionCall: { name: "get_2027_plan", args: {} } }] } }],
+      })
+      .mockRejectedValueOnce(new Error("429 RESOURCE_EXHAUSTED GenerateRequestsPerDayPerProjectPerModel-FreeTier"))
+      .mockResolvedValueOnce({
+        functionCalls: [],
+        text: "Base cash is ₹54.1L (P10-P90 ₹42.0L to ₹65.8L) and stretch is ₹1.27 Cr.",
+      });
+
+    const res = await (await POST(new Request("http://localhost/api/chat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "What are our 2027 targets?" }], as_of: "2025-04-20" }),
+    }))).json();
+    expect(res.reply).toContain("₹54.1L");
+    expect(res.model).toBe("gemini-3.1-flash-lite");
+  });
 });
 
